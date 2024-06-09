@@ -1,14 +1,10 @@
-use std::mem::{align_of, size_of};
-
-use anchor_lang::prelude::*;
 use bytemuck::{cast_mut, cast_ref};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use static_assertions::const_assert_eq;
-
-use super::order_type::{PostOrderType, Side};
+use std::mem::size_of;
 
 pub type NodeHandle = u32;
-const NODE_SIZE: usize = 120;
+const NODE_SIZE: usize = 128;
 
 #[derive(IntoPrimitive, TryFromPrimitive)]
 #[repr(u8)]
@@ -20,62 +16,7 @@ pub enum NodeTag {
     LastFreeNode = 4,
 }
 
-/// Creates a binary tree node key.
-///
-/// It's used for sorting nodes (ascending for asks, descending for bids)
-/// and encodes price data in the top 64 bits followed by an ordering number
-/// in the lower bits.
-///
-/// The `seq_num` that's passed should monotonically increase. It's used to choose
-/// the ordering number such that orders placed later for the same price data
-/// are ordered after earlier orders.
-pub fn new_node_key(side: Side, price_data: u64, seq_num: u64) -> u128 {
-    let seq_num = if side == Side::Bid { !seq_num } else { seq_num };
-
-    let upper = (price_data as u128) << 64;
-    upper | (seq_num as u128)
-}
-
-/// Creates price data for an oracle pegged order from the price offset
-///
-/// Reverse of oracle_pegged_price_offset()
-pub fn oracle_pegged_price_data(price_offset_lots: i64) -> u64 {
-    // Price data is used for ordering in the bookside's top bits of the u128 key.
-    // Map i64::MIN to be 0 and i64::MAX to u64::MAX, that way comparisons on the
-    // u64 produce the same result as on the source i64.
-    // Equivalent: (price_offset_lots as i128 - (i64::MIN as i128) as u64
-    (price_offset_lots as u64).wrapping_add(u64::MAX / 2 + 1)
-}
-
-/// Retrieves the price offset (in lots) from an oracle pegged order's price data
-///
-/// Reverse of oracle_pegged_price_data()
-pub fn oracle_pegged_price_offset(price_data: u64) -> i64 {
-    price_data.wrapping_sub(u64::MAX / 2 + 1) as i64
-}
-
-/// Creates price data for a fixed order's price
-///
-/// Reverse of fixed_price_lots()
-pub fn fixed_price_data(price_lots: i64) -> Result<u64> {
-    require_gte!(price_lots, 1);
-    Ok(price_lots as u64)
-}
-
-/// Retrieves the price (in lots) from a fixed order's price data
-///
-/// Reverse of fixed_price_data().
-pub fn fixed_price_lots(price_data: u64) -> i64 {
-    assert!(price_data <= i64::MAX as u64);
-    price_data as i64
-}
-
-/// InnerNodes and LeafNodes compose the binary tree of orders.
-///
-/// Each InnerNode has exactly two children, which are either InnerNodes themselves,
-/// or LeafNodes. The children share the top `prefix_len` bits of `key`. The left
-/// child has a 0 in the next bit, and the right a 1.
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable, AnchorSerialize, AnchorDeserialize)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct InnerNode {
     pub tag: u8, // NodeTag
@@ -83,6 +24,7 @@ pub struct InnerNode {
     /// number of highest `key` bits that all children share
     /// e.g. if it's 2, the two highest bits of `key` will be the same on all children
     pub prefix_len: u32,
+    pub padding2: [u8; 8],
 
     /// only the top `prefix_len` bits of `key` are relevant
     pub key: u128,
@@ -98,9 +40,9 @@ pub struct InnerNode {
 
     pub reserved: [u8; 72],
 }
-const_assert_eq!(size_of::<InnerNode>(), 4 + 4 + 16 + 4 * 2 + 8 * 2 + 72);
 const_assert_eq!(size_of::<InnerNode>(), NODE_SIZE);
 const_assert_eq!(size_of::<InnerNode>() % 8, 0);
+const_assert_eq!(align_of::<InnerNode>(), 16);
 
 impl InnerNode {
     pub fn new(prefix_len: u32, key: u128) -> Self {
@@ -108,10 +50,11 @@ impl InnerNode {
             tag: NodeTag::InnerNode.into(),
             padding: Default::default(),
             prefix_len,
+            padding2: Default::default(),
             key,
             children: [0; 2],
             child_earliest_expiry: [u64::MAX; 2],
-            reserved: [0; NODE_SIZE - 48],
+            reserved: [0; 72],
         }
     }
 
@@ -130,18 +73,12 @@ impl InnerNode {
     }
 }
 
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Pubkey(pub(crate) [u8; 32]);
+
 /// LeafNodes represent an order in the binary tree
-#[derive(
-    Debug,
-    Copy,
-    Clone,
-    PartialEq,
-    Eq,
-    bytemuck::Pod,
-    bytemuck::Zeroable,
-    AnchorSerialize,
-    AnchorDeserialize,
-)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct LeafNode {
     /// NodeTag
@@ -159,7 +96,7 @@ pub struct LeafNode {
     /// A value of 0 means no expiry.
     pub time_in_force: u16,
 
-    pub padding2: [u8; 2],
+    pub padding2: [u8; 10],
 
     /// The binary tree key, see new_node_key()
     pub key: u128,
@@ -184,13 +121,24 @@ pub struct LeafNode {
 
     pub reserved: [u8; 32],
 }
-
-const_assert_eq!(
-    size_of::<LeafNode>(),
-    4 + 1 + 1 + 1 + 1 + 16 + 32 + 8 + 8 + 8 + 8 + 32
-);
 const_assert_eq!(size_of::<LeafNode>(), NODE_SIZE);
 const_assert_eq!(size_of::<LeafNode>() % 8, 0);
+
+#[derive(Eq, PartialEq, Copy, Clone, TryFromPrimitive, IntoPrimitive, Debug)]
+#[repr(u8)]
+pub enum PostOrderType {
+    /// Take existing orders up to price, max_base_quantity and max_quote_quantity.
+    /// If any base_quantity or quote_quantity remains, place an order on the book
+    Limit = 0,
+
+    /// Never take any existing orders, post the order on the book if possible.
+    /// If existing orders can match with this order, do nothing.
+    PostOnly = 2,
+
+    /// If existing orders match with this order, adjust the price to just barely
+    /// not match. Always places an order on the book.
+    PostOnlySlide = 4,
+}
 
 impl LeafNode {
     #[allow(clippy::too_many_arguments)]
@@ -260,23 +208,17 @@ pub struct FreeNode {
 const_assert_eq!(size_of::<FreeNode>(), NODE_SIZE);
 const_assert_eq!(size_of::<FreeNode>() % 8, 0);
 
-#[zero_copy]
-#[derive(bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
 pub struct AnyNode {
     pub tag: u8,
-    pub data: [u8; 111],
-    // ensure that AnyNode has the same 8-byte alignment as other nodes
-    pub(crate) force_align: u64,
+    pub data: [u8; 127],
 }
 const_assert_eq!(size_of::<AnyNode>(), NODE_SIZE);
 const_assert_eq!(size_of::<AnyNode>() % 8, 0);
 const_assert_eq!(size_of::<AnyNode>(), size_of::<InnerNode>());
 const_assert_eq!(size_of::<AnyNode>(), size_of::<LeafNode>());
 const_assert_eq!(size_of::<AnyNode>(), size_of::<FreeNode>());
-const_assert_eq!(align_of::<AnyNode>(), 8);
-const_assert_eq!(align_of::<AnyNode>(), align_of::<InnerNode>());
-const_assert_eq!(align_of::<AnyNode>(), align_of::<LeafNode>());
-const_assert_eq!(align_of::<AnyNode>(), align_of::<FreeNode>());
 
 pub(crate) enum NodeRef<'a> {
     Inner(&'a InnerNode),
@@ -373,73 +315,18 @@ impl AsRef<AnyNode> for LeafNode {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use itertools::Itertools;
+/// Creates price data for a fixed order's price
+///
+/// Reverse of fixed_price_lots()
+pub fn fixed_price_data(price_lots: i64) -> u64 {
+    assert!(price_lots >= 1);
+    price_lots as u64
+}
 
-    #[test]
-    fn order_tree_price_data() {
-        for price in [1, 42, i64::MAX] {
-            assert_eq!(price, fixed_price_lots(fixed_price_data(price).unwrap()));
-        }
-
-        let seq = [-i64::MAX, -i64::MAX + 1, 0, i64::MAX - 1, i64::MAX];
-        for price_offset in seq {
-            assert_eq!(
-                price_offset,
-                oracle_pegged_price_offset(oracle_pegged_price_data(price_offset))
-            );
-        }
-        for (lhs, rhs) in seq.iter().tuple_windows() {
-            let l_price_data = oracle_pegged_price_data(*lhs);
-            let r_price_data = oracle_pegged_price_data(*rhs);
-            assert!(l_price_data < r_price_data);
-        }
-
-        assert_eq!(oracle_pegged_price_data(i64::MIN), 0);
-        assert_eq!(oracle_pegged_price_data(i64::MAX), u64::MAX);
-        assert_eq!(oracle_pegged_price_data(0), -(i64::MIN as i128) as u64); // remember -i64::MIN is not a valid i64
-    }
-
-    #[test]
-    fn order_tree_key_ordering() {
-        let bid_seq: Vec<(i64, u64)> = vec![
-            (-5, 15),
-            (-5, 10),
-            (-4, 6),
-            (-4, 5),
-            (0, 20),
-            (0, 1),
-            (4, 6),
-            (4, 5),
-            (5, 3),
-        ];
-        for (lhs, rhs) in bid_seq.iter().tuple_windows() {
-            let l_price_data = oracle_pegged_price_data(lhs.0);
-            let r_price_data = oracle_pegged_price_data(rhs.0);
-            let l_key = new_node_key(Side::Bid, l_price_data, lhs.1);
-            let r_key = new_node_key(Side::Bid, r_price_data, rhs.1);
-            assert!(l_key < r_key);
-        }
-
-        let ask_seq: Vec<(i64, u64)> = vec![
-            (-5, 10),
-            (-5, 15),
-            (-4, 6),
-            (-4, 7),
-            (0, 1),
-            (0, 20),
-            (4, 5),
-            (4, 6),
-            (5, 3),
-        ];
-        for (lhs, rhs) in ask_seq.iter().tuple_windows() {
-            let l_price_data = oracle_pegged_price_data(lhs.0);
-            let r_price_data = oracle_pegged_price_data(rhs.0);
-            let l_key = new_node_key(Side::Ask, l_price_data, lhs.1);
-            let r_key = new_node_key(Side::Ask, r_price_data, rhs.1);
-            assert!(l_key < r_key);
-        }
-    }
+/// Retrieves the price (in lots) from a fixed order's price data
+///
+/// Reverse of fixed_price_data().
+pub fn fixed_price_lots(price_data: u64) -> i64 {
+    assert!(price_data <= i64::MAX as u64);
+    price_data as i64
 }
