@@ -534,4 +534,146 @@ mod tests {
             recursive_check(order_tree, r);
         }
     }
+
+    #[test]
+    fn order_tree_expiry_manual() {
+        let mut bids = new_order_tree(OrderTreeType::Bids);
+        let new_expiring_leaf = |key: u128, expiry: u64| {
+            LeafNode::new(
+                0,
+                key,
+                Pubkey([0u8; 32]),
+                0,
+                expiry - 1,
+                PostOrderType::Limit,
+                1,
+                -1,
+                0,
+            )
+        };
+
+        let mut root = OrderTreeRoot {
+            maybe_node: 0,
+            leaf_count: 0,
+        };
+
+        assert!(bids.find_earliest_expiry(&root).is_none());
+
+        bids.insert_leaf(&mut root, &new_expiring_leaf(0, 5000))
+            .unwrap();
+        assert_eq!(
+            bids.find_earliest_expiry(&root).unwrap(),
+            (root.maybe_node, 5000)
+        );
+        verify_order_tree(&bids, &root);
+
+        let (new4000_h, _) = bids
+            .insert_leaf(&mut root, &new_expiring_leaf(1, 4000))
+            .unwrap();
+        assert_eq!(bids.find_earliest_expiry(&root).unwrap(), (new4000_h, 4000));
+        verify_order_tree(&bids, &root);
+
+        let (_new4500_h, _) = bids
+            .insert_leaf(&mut root, &new_expiring_leaf(2, 4500))
+            .unwrap();
+        assert_eq!(bids.find_earliest_expiry(&root).unwrap(), (new4000_h, 4000));
+        verify_order_tree(&bids, &root);
+
+        let (new3500_h, _) = bids
+            .insert_leaf(&mut root, &new_expiring_leaf(3, 3500))
+            .unwrap();
+        assert_eq!(bids.find_earliest_expiry(&root).unwrap(), (new3500_h, 3500));
+        verify_order_tree(&bids, &root);
+        // the first two levels of the tree are innernodes, with 0;1 on one side and 2;3 on the other
+        assert_eq!(
+            bids.node_mut(root.maybe_node)
+                .unwrap()
+                .as_inner_mut()
+                .unwrap()
+                .child_earliest_expiry,
+            [4000, 3500]
+        );
+
+        bids.remove_by_key(&mut root, 3).unwrap();
+        verify_order_tree(&bids, &root);
+        assert_eq!(
+            bids.node_mut(root.maybe_node)
+                .unwrap()
+                .as_inner_mut()
+                .unwrap()
+                .child_earliest_expiry,
+            [4000, 4500]
+        );
+        assert_eq!(bids.find_earliest_expiry(&root).unwrap().1, 4000);
+
+        bids.remove_by_key(&mut root, 0).unwrap();
+        verify_order_tree(&bids, &root);
+        assert_eq!(
+            bids.node_mut(root.maybe_node)
+                .unwrap()
+                .as_inner_mut()
+                .unwrap()
+                .child_earliest_expiry,
+            [4000, 4500]
+        );
+        assert_eq!(bids.find_earliest_expiry(&root).unwrap().1, 4000);
+
+        bids.remove_by_key(&mut root, 1).unwrap();
+        verify_order_tree(&bids, &root);
+        assert_eq!(bids.find_earliest_expiry(&root).unwrap().1, 4500);
+
+        bids.remove_by_key(&mut root, 2).unwrap();
+        verify_order_tree(&bids, &root);
+        assert!(bids.find_earliest_expiry(&root).is_none());
+    }
+
+    #[test]
+    fn order_tree_expiry_random() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+
+        let mut root = OrderTreeRoot {
+            maybe_node: 0,
+            leaf_count: 0,
+        };
+        let mut bids = new_order_tree(OrderTreeType::Bids);
+        let new_expiring_leaf = |key: u128, expiry: u64| {
+            LeafNode::new(
+                0,
+                key,
+                Pubkey([0u8; 32]),
+                0,
+                expiry - 1,
+                PostOrderType::Limit,
+                1,
+                -1,
+                0,
+            )
+        };
+
+        // add 200 random leaves
+        let mut keys = vec![];
+        for _ in 0..200 {
+            let key: u128 = rng.gen_range(0, 10000); // overlap in key bits
+            if keys.contains(&key) {
+                continue;
+            }
+            let expiry = rng.gen_range(1, 200); // give good chance of duplicate expiry times
+            keys.push(key);
+            bids.insert_leaf(&mut root, &new_expiring_leaf(key, expiry))
+                .unwrap();
+            verify_order_tree(&bids, &root);
+        }
+
+        // remove 50 at random
+        for _ in 0..50 {
+            if keys.len() == 0 {
+                break;
+            }
+            let k = keys[rng.gen_range(0, keys.len())];
+            bids.remove_by_key(&mut root, k).unwrap();
+            keys.retain(|v| *v != k);
+            verify_order_tree(&bids, &root);
+        }
+    }
 }
